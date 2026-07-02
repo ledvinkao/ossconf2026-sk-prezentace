@@ -1,0 +1,234 @@
+---
+title: "OSSConf2026 -- demonstrace technik paralelizace s rastrovými objekty R balíčku {terra}"
+author: 
+    name: Ondřej Ledvinka
+    email: "ondrej.ledvinka@chmi.cz"
+format: html
+embed-resources: true
+toc: true
+editor: visual
+date: 2026-07-01
+date-modified: '`r Sys.Date()`'
+bibliography: references.bib
+csl: iso690-author-date-cs.csl
+theme: darkly
+lang: cs
+engine: knitr
+---
+
+## Předpoklady a načtení příkladových rastrových geodat do prostředí R
+
+Budeme potřebovat nějaká rastrová geodata, ideálně publikovaná na iternetu pod licencí, která umožňuje jejich využití zdarma. Takovými geodaty v klimatologii mohou být vrstvy klimatických scénářů. Tato geodata lze v podobě NetCDF souborů stáhnout např. z *Climate Data Store* (CDS) služby *Climate Change Service* evropského programu *Copernicus* (viz <https://cds.climate.copernicus.eu/>).
+
+Zaměřme se např. na historický experiment CORDEX (zde období 1961--1990) a doménu Evropy a jako klimatický prvek vyberme průměrnou denní teplotu. Zaměříme se např. na regionální klimatický model MOHC-HadREM3-GA7-05_v1. Pro přístup k souborům musíme být registrovaní uživatelé CDS a pro pohodlné stažení podkladových souborů můžeme využít např. funkce balíčku `ecmwfr` [@ecmwfr].
+
+Následně budeme předpokládat, že NetCDF soubory máme převedeny do GeoTIFF souborů, před jejichž tvorbou jsme ještě všechny rastrové vrstvy (pro každý den jedna) technikou warpingu dostali do souřadnicového referenčního systému WGS 84 (EPSG:4326) a proklamovaného prostorového rozlišení 0,11°. K tomu se osvědčila funkce `gdal_utils()` balíčku `sf` [@pebesma2023]. Alternativně lze využít funkcí `gdalwarp()` z balíčku `gdalUtilities` [@gdalUtilities]. Tyto GeoTIFF soubory jsou uloženy ve složce *geodata* R projektu.
+
+K práci s obsahem souborů budeme používat především funkce balíčku `terra` [@terra]a balíčků světa *tidyverse*. Ke kreslení výsledných rastrových vrstev se někdy hodí i vektorová geodata. A protože se hodláme převážně zabývat územím Česka, budeme využívat vybrané funkce balíčku `RCzechia` [@lacko2023], a tedy i dobrého připojení k internetu, jelikož vektorové vrstvy se při jejich prvním použití stahují do dočasného souboru tvořeného při sezení.
+
+Načtěme tedy všechny balíčky, o kterých si myslíme, že je budeme potřebovat. Balíčky, které načteme funkcí `xfun::pkg_attach2()` nainstalované předem mít nemusíme. Ovšem při aplikaci tzv. démonů způsobem doporučeným v nápovědě k funkci `purrr::in_parallel()` musíme mít nainstalovaný minimálně balíček `mirai` [@mirai]. Instalace balíčku `xfun` [@xfun] pro zprovoznění následujícího kódu je nutností.
+
+Zřejmě narazíme i na další balíčky, které, hlavně kvůli praktické ukázce, musíme mít nainstalované, protože funkce z nich budou volány prostřednictvím kostruktu s dvěma dvojtečkami.
+
+```{r}
+#| label: nacteni-balicku
+xfun::pkg_attach2("tidyverse", # důležité jsou hlavně balíčky purrr a ggplot2
+                  "terra",
+                  "RCzechia", # načítá i balíček sf
+                  "fs", # balíček pro správu složek apod.
+                  message = F) # můžeme ztišit startovní zprávy, včetně upozornění na konflikty
+```
+
+Pro načtení nejprve vytvoříme vektor cest k souborům a následně aplikujeme funkci `terra::rast()`.
+
+```{r}
+#| label: nacteni-vsech-vrstev
+soubory <- dir("geodata",
+               pattern = "\\.tif$",
+               full.names = T)
+
+# funkce rast() umí načítat rovnou z více souborů najednou
+# u všech rastrových vrstev však nejprve musí nalézt stejnou geometrii
+r <- rast(soubory)
+
+# podívejme se na hlavičku a začátek vzniklého objektu
+r
+```
+
+## Specifika rastrových geodat v R ve vztahu k serializaci a paralelizaci
+
+V hlavičce objektu jsme si mohli všimnout, že třída načítáním vzniklého objektu je *SpatRaster*. Ve skutečnosti jde ale o formální třídu, jak ukazuje Globální prostředí. Znamená to, že data nemáme načtená v RAM, ale máme jen jakýsi odkaz na data v souborech, odkud se hodnoty berou jen tehdy, potřebujeme-li je (např. k výpočtům, ke kreslení apod.). Můžeme si všimnout informace o souborech, na které se objekt odkazuje.
+
+Toto zásadní specifikum vyžaduje aplikování speciálních funkcí, chceme-li takové objekty serializovat a ukládat do RDS souborů. Obdobně na to musíme pamatovat, chceme-li na tyto rastrové objekty aplikovat paralelizaci. Zde je tedy zásadní nastudovat si význam funkce `terra::wrap()` a povšimnout si také jejího relativně nového argumentu `proxy`. Opakem funkce `terra::wrap()` je funkce `terra::unwrap()`, která se používá např. v mapovaných funkcích, když je proces popoháněn paralelizací., ale i při aktivaci argumentu `cores` ve funkcích `terra::app()` a jí podobných.
+
+Vedle tohoto zásadního specifika ve zdejších příkladových souborech máme ještě jednu zajímavou zvláštnost, a sice, že klimatologové u tohoto modelu používají trochu atypický kalendář se 30 dny pro každý měsíc bez ohledu na délku reálných měsíců danou počtem dní. Tato skutečnost způsobuje, že bez úpravy nelze použít funkci `terra::tapp()` s argumentem `index = "yearmonths"`, pro agregaci dle let a měsíců, kdybychom např. chtěli získat vrstvy průměrné měsíční teploty vzduchu.
+
+V argumentu `index` však může být jakákoliv grupující veličina či kombinace grupujících veličin, takže lze pro agregaci využít postup naznačený v doprovodném příspěvku ve sborníku konference. Z důvodu času se ještě raději omezme pouze na území Česka.
+
+```{r}
+#| label: prumerna-mesicni-teplota
+# stáhneme polygon, podle kterého se omezíme na dané území
+hranice <- republika()
+
+rcz <- r |> 
+  crop(hranice, # není třeba transformovat, crs jsou stejné
+       mask = T) # můžeme rovnou i maskovat
+
+# vytvořme grid s indexy pro agregaci funkcí terra::tapp()
+g <- expand.grid(1961:1990,
+                 rep(1:12,
+                     each = 30)) |> 
+  as.data.frame() |> 
+  as_tibble() |> 
+  arrange(Var1,
+          Var2) |> 
+  group_by(Var1,
+           Var2) |> 
+  mutate(id = cur_group_id())
+
+# aplikujme samotnou agregaci
+rcz_mesice <- rcz |> 
+  tapp(index = g$id,
+       fun = "mean")
+
+# nyní bychom měli mít k dispozici 30 * 12 rastrových vrstev
+nlyr(rcz_mesice)
+
+# vykresleme jednoduchým způsobem třeba červenec 1961
+plot(rcz_mesice[[7]])
+
+# vidíme, že jednotkami nejsou °C, dokumentace k na CDS dokonce prozrazuje, že se jedná o °K
+# převeďme °K na °C (budeme to potřebovat dále) a výsledek zaokrouhleme na jedno desetinné místo
+rcz_mesice_celsius <- (rcz_mesice - 273.15) |> 
+  round(1)
+
+plot(rcz_mesice_celsius[[7]])
+
+# ještě si pro úplnost vrstvy pojmenujme a přidělme informaci o datumu
+names(rcz_mesice_celsius) <- str_c("ym_",
+                                   format(seq(ym(196101),
+                                              ym(199012),
+                                              "month"),
+                                          "%Y%m"))
+
+time(rcz_mesice_celsius) <- seq(ym(196101),
+                                ym(199012),
+                                "month")
+
+# co vzniklo?
+rcz_mesice_celsius
+```
+
+## Praktická ukázka aplikace paralelizace práce s rastrovými geodaty v R s měřením stráveného času
+
+Řekněme, že máme za úkol z rastrových vrstev teploty vzduchu (v měsíčním časovém kroku a ve °C) získat rastrové vrstvy potenciální evapotranspirace (PET) dle Thornthwaiteho přístupu, který jako jedinou proxy proměnnou potřebuje právě průměrnou měsíční teplotu vzduchu. Kromě toho se uvažuje zeměpisná šířka (lze ji nahradit zeměpisnou šířkou centroidu buňky rastru) a samozřejmě časová poloha v rámci roku, kdy zimní měsíce nevykazují témeř žádnou PET, kdežto teplejší letní měsíce vykazují mnohem vyšší hodnoty PET.
+
+Výpočet PET dle Thornthwaiteho umožňuje např. funkce `thornthwaite()` z balíčku `SPEI` [@SPEI]. Tato funkce však není implementována nativně v `C++` v balíčku `terra`. Jsme tedy nuceni za pomoci této pojmenované funkce aplikovat tzv. anonymní funkci, jejíž mapování uvnitř funkcí `terra::app()` nebo `terra::lapp()` lze za splněných podmínek nativně paralelizovat argumentem `cores`. To se zde bohužel nedaří, tak vypočítáme nejprve PET bez paralelizace a sílu paralelizace si namísto toho následně ukážeme při ukládání nově vzniklých geodat do souborů.
+
+Zaměřme se tedy jen na území Česka, abychom se nezdržovali s velkými daty. Budeme demonstrovat postup za využití funkce `terra::lapp()`, která akceptuje také třídu zvanou *SpatRasterDataset*. Pomocí funkcí balíčku `tictoc` [@tictoc] si poprvé změříme čas strávený procesem.
+
+```{r}
+#| label: vypocet-pet
+# vytvořme tzv. SpatRasterDataset, ve kterém prvním prvkem bude původní rastrový objekt s průměrnou měsíční teplotou a ve druhém bude jediná vrstva se zeměpisnými šířkami buněk
+s <- sds(rcz_mesice_celsius,
+         init(rcz_mesice_celsius, # funkcí terra::init() získáme snadno novou vrstvu zeměpisných šířek
+              fun = "y"))
+
+# teď je možné aplikovat funkci terra::lapp()
+# zkusme nastavit o jedno jádro méně, než máme k dispozici
+# zároveň měřme čas
+tictoc::tic(msg = "čas strávený odvozením PET") # tictoc musí být nainstalovaný
+pet <- lapp(s,
+            fun = \(x, y) {
+              if (all(is.na(x))) {return(rep(NA, # podmínku musíme nastavit, jinak jsou vráceny nuly i pro místa, kde výpočet nemůže proběhnout
+                                             times = length(x)))
+              }
+              else {SPEI::thornthwaite(Tave = x, # SPEI musí být nainstalovaný
+                                       lat = y,
+                                       na.rm = T, # nastavujeme kvůli hláškám, ostatních hlášek si nevšímáme
+                                       verbose = F)
+              }
+            })
+tictoc::toc()
+
+# ještě poslední úpravy
+pet <- pet |> 
+  round(1)
+
+names(pet) <- names(rcz_mesice_celsius)
+
+time(pet) <- time(rcz_mesice_celsius)
+
+# vykreslíme opět červenec 1961
+plot(pet[[7]])
+```
+
+Ukládání jednotlivých rastrových vrstev do separátních souborů je často chtěnou úlohou, kterou žádají uživatelé, kteří jsou zvyklí si v grafickém GIS vykreslovat jednu vrstvu po druhé. Dokumentace k funkci `terra::writeRaster()` uvádí, že tato funkce dokáže tuto úlohu splnit, bude-li počet názvů vrstev shodný s počtem vrstev v objektu třídy *SpatRaster*. Ale v určité době (možná jen s nějakou verzí balíčku `terra`) byly na OS Windows pozorovány nějaké problémy.
+
+```{r}
+#| label: jednoduche-ulozeni
+# nastavme vektor cest a názvů souborů
+# podsložku vystup1 máme vytvořenou předem
+
+if (!dir_exists("geodata/vystup1")) dir_create("geodata/vystup1") # tvoříme podsložku, pokud neexistuje
+
+nazvy <- str_glue("geodata/vystup1/pet_{names(pet)}.tif")
+
+# uložme vrstvy zvlášť nativním způsobem
+tictoc::tic(msg = "čas strávený nativním způsobem ukládání souborů")
+writeRaster(pet,
+            nazvy,
+            overwrite = T) # pro případ, že bychom už některé soubory dříve vytvořili a chtěli je přepsat
+tictoc::toc()
+```
+
+Ovšem při paralelizaci s tzv. démony (pracovníky) vytvořenými funkcemi balíčku `mirai` můžeme docílit rychlejšího uložení. Před paralelizací s démony je vhodné si připravit seznam rastrových objektů tak, aby každý prvek obsahoval optimální počet vrstev. Zde zkusíme s jednou, přičemž pro tento účel můžeme aplikovat funkci `terra::as.list()`.
+
+```{r}
+#| label: ulozeni-s-demony
+# nejprve můžeme vytvořit vhodnou tabulku, která umožní mapování různých funkcí s využitím jejích sloupců (ať již vektorů nebo seznamů)
+
+if (!dir_exists("geodata/vystup2")) dir_create("geodata/vystup2")
+
+tab <- tibble(vrstvy = as.list(pet)) |> 
+  mutate(nazvy = map_chr(vrstvy,
+                         \(x) str_glue("geodata/vystup2/pet_{names(x)}.tif")),
+         vrstvy_wrap = map(vrstvy, # chceme-li paralelizovat, musíme rastrové objekty tzv. sbalit
+                           \(x) wrap(x,
+                                     proxy = T)))
+         
+# co vlastně vzniklo?
+tab
+
+# nyní aplikujme funkcionální programování (mapování funkcí) spojené s paralelizací s démony
+# nastavme nejprve počet démonů
+mirai::daemons(0) # slouží pouze pro případný reset
+
+# stroj, na kterém vznikal tento HTML dokument má 48 logických jader a 128 GB RAM
+# raději ale pro šetření s RAM nasjtavíme jen polovinu možných démonů
+mirai::daemons(parallel::detectCores() / 2)
+
+mirai::require_daemons() # někdy se nemusí paralelizovaný proces spustit a tímto ho potvrdíme
+
+tictoc::tic(msg = "čas strávený ukládáním souborů s démony")
+walk2(tab$vrstvy_wrap,
+      tab$nazvy,
+      in_parallel(\(x, y) terra::writeRaster(terra::unwrap(x), # démoni musí vědět, odkud se berou funkce, které nejsou v základním R
+                                             y,
+                                             overwrite = T)))
+tictoc::toc()
+
+mirai::daemons(0) # opět reset
+```
+
+## Závěrečná doporučení
+
+- Za využití počítače, který byl využit při tvorbě demonstrace, se nepodařilo nativně nastavený proces ukládání rastrových vrstev do souborů procesem kombinovaným s démony překonat. Paralelizování s démony se ale určitě vyplatí, jen to chce zpočátku experimentovat s vlastními daty, stroji a funkcemi, které jsou k dispozici. Každý si určitě najde typy úloh, pro které uvedený postup s démony může sloužit jako vzor.
+
+- Je třeba uvážit, zda se nám paralelizace vyplatí a zda má smysl investovat čas do psaní delšího kódu. U větších dat a se strojem s rozumnou kombinací logických jader a RAM se zcela jistě urychlení již potvrdí.
+
+- Je třeba si uvědomit, že při menším množství dat dominují nativní přístupy, protože pro démony (a jiné typy paralelizace) musíme napřed připravit půdu např. rozdělením rastrových vrstev do prvků seznamu, sbalením těchto vrstev, rozbalením v mapované funkci apod. To vše i s optimalizací využití RAM nějakou dobu zabere.
+
+- U klimatologických rastrových geodat s měsíčním nebo denním krokem bylo praxí zjištěno, že optimální je ukládání do souborů reprezentujících roky. Funkci `terra::as.list()` tedy nelze v kombinaci s démony doporučit.
+
+## Literatura
